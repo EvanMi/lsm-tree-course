@@ -40,7 +40,7 @@ public class BufferCleanUtil {
         }
     }
 
-    private static ByteBuffer viewed(ByteBuffer buffer) {
+    public static ByteBuffer viewed(ByteBuffer buffer) {
         String methodName = "viewedBuffer";
         Method[] methods = buffer.getClass().getMethods();
         for (int i = 0; i < methods.length; i++) {
