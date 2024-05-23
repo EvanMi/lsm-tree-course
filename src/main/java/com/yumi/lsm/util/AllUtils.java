@@ -25,4 +25,14 @@ public class AllUtils {
         }
         return -1;
     }
+
+    public static int sharedPrefixLen(byte[] key, byte[] preKey) {
+        int i = 0;
+        for(; i < key.length && i < preKey.length; i++) {
+            if (key[i] != preKey[i]) {
+                break;
+            }
+        }
+        return i;
+    }
 }
