@@ -96,12 +96,16 @@ public class BlockBufferPool {
         BufferCleanUtil.clean(byteBuffer);
     }
 
-    public ByteBuffer borrowBuffer() {
+    public ByteBuffer borrowBuffer(int size) {
         if (!active) {
             throw new IllegalStateException("buffer pool 已关闭");
         }
         borrowLock.readLock().lock();
         try {
+            if (size > this.bufferSize) {
+                //太大了~~
+                return ByteBuffer.allocate(size);
+            }
             ByteBuffer byteBuffer = this.availableBuffers.pollFirst();
             if (null == byteBuffer) {
                 //降级

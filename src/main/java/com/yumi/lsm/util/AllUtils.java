@@ -35,4 +35,14 @@ public class AllUtils {
         }
         return i;
     }
+
+    public static byte[] getSeparatorBetween(byte[] preKey, byte[] key) {
+        if (preKey.length == 0) {
+            byte[] separator = new byte[key.length];
+            System.arraycopy(key, 0, separator, 0, key.length);
+            separator[separator.length - 1] = (byte)(separator[separator.length - 1] - 1);
+            return separator;
+        }
+        return preKey;
+    }
 }

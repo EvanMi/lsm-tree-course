@@ -47,7 +47,7 @@ public class BlockTest {
 
     @Test
     public void testExtendableBlockNeverFull() {
-        Block block = new ExtendableBlock(config);
+        Block block = new ExtendableBlock(config, 1024);
         boolean res1 = block.append(key1, val1);
         boolean res2 = block.append(key2, val2);
         boolean res3 = block.append(key1, val1);
@@ -59,7 +59,7 @@ public class BlockTest {
 
     @Test
     public void testFlushTo() {
-        Block block = new ExtendableBlock(config);
+        Block block = new ExtendableBlock(config, 1024);
         boolean res1 = block.append(key1, val1);
         boolean res2 = block.append(key2, val2);
         boolean res3 = block.append(key1, val1);

@@ -11,4 +11,9 @@ public class DataBlock extends Block{
     protected boolean isFixedSize() {
         return true;
     }
+
+    @Override
+    protected int blockSize() {
+        return getConfig().getSstDataBlockSize();
+    }
 }

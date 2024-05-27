@@ -22,7 +22,7 @@ public abstract class Block {
     public Block(Config config) {
         this.config = config;
         this.record = new ArrayList<>();
-        this.record.add(this.config.getBlockBufferPool().borrowBuffer());
+        this.record.add(this.config.getBlockBufferPool().borrowBuffer(blockSize()));
     }
 
 
@@ -42,7 +42,7 @@ public abstract class Block {
                 //不能扩容，返回false
                 return false;
             } else {
-                buffer = this.config.getBlockBufferPool().borrowBuffer();
+                buffer = this.config.getBlockBufferPool().borrowBuffer(blockSize());
                 this.record.add(buffer);
             }
         }
@@ -88,7 +88,7 @@ public abstract class Block {
         this.entriesCnt = 0;
         this.record.clear();
         this.preKey = new byte[0];
-        this.record.add(this.config.getBlockBufferPool().borrowBuffer());
+        this.record.add(this.config.getBlockBufferPool().borrowBuffer(blockSize()));
     }
 
     public byte[] getPreKey() {
@@ -106,4 +106,6 @@ public abstract class Block {
     public List<ByteBuffer> getRecord() {
         return record;
     }
+
+    protected abstract int blockSize();
 }
