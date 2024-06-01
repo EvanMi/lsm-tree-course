@@ -13,12 +13,15 @@ import org.jctools.queues.SpscArrayQueue;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.PriorityQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class Tree {
@@ -50,7 +53,9 @@ public class Tree {
         for (int i = 0; i < levelLocks.length; i++) {
             levelLocks[i] = new ReentrantReadWriteLock();
         }
+        //加载文件
         newMemTable(config.getWalFileSize());
+        new Thread(this::doBackendTask).start();
     }
 
     public void put(byte[] key, byte[] value) {
@@ -93,11 +98,170 @@ public class Tree {
 
     private void doBackendTask() {
         while (!stop.get()) {
-            MemTableCompactItem item = memCompactQueue.poll();
-            if (null != item) {
-                this.compactMemTable(item);
+            try {
+                int processCnt = 0;
+                for (int i = 0; i < 60; i++) {
+                    MemTableCompactItem item = this.memCompactQueue.poll();
+                    if (null != item) {
+                        this.compactMemTable(item);
+                        processCnt++;
+                    } else {
+                        break;
+                    }
+                }
+                int lastLevel = -1;
+                for (int i = 0; i < 30; i++) {
+                    Integer level = this.levelCompactQueue.poll();
+                    if (null != level) {
+                        if (lastLevel == level) {
+                            continue;
+                        }
+                        lastLevel = level;
+                        this.compactLevel(level);
+                        processCnt++;
+                    } else {
+                        break;
+                    }
+                }
+                if (processCnt == 0) {
+                    TimeUnit.MILLISECONDS.sleep(500);
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
             }
         }
+    }
+
+    private void compactLevel(int level) {
+        List<Node> pickedNodes = pickCompactNodes(level);
+        if (pickedNodes.isEmpty()) {
+            return;
+        }
+        int seq = levelToSeq[level + 1].get() + 1;
+        SstWriter sstWriter = new SstWriter(sstFile(level + 1, seq), config);
+        int sstLimit = config.getLevelSstSize(level + 1);
+        try {
+            //文件会很大~不能把pickedNodes全部读取进来，要以block为单位进行归并排序
+            int pickedSize = pickedNodes.size();
+            PriorityQueue<Kv> pq = new PriorityQueue<>((kv1, kv2) -> AllUtils.compare(kv1.getKey(), kv2.getKey()));
+
+            Index[][] pickedIndex = new Index[pickedSize][];
+            Map<Kv, Integer> nextCurMap = new HashMap<>();
+            Map<Kv, Integer> indexCurMap = new HashMap<>();
+            for (int i = 0; i < pickedSize; i++) {
+                pickedIndex[i] = pickedNodes.get(i).indices();
+                if (pickedIndex[i].length > 0) {
+                    int prevBlockOffset = pickedIndex[i][0].getBlockOffset();
+                    int prevBlockSize = pickedIndex[i][0].getBlockSize();
+                    Kv[] range = pickedNodes.get(i).getRange(prevBlockOffset, prevBlockSize);
+                    for (int k = 0; k < range.length; k++) {
+                        pq.add(range[k]);
+                        if (k == range.length - 1) {
+                            nextCurMap.put(range[k], 1);
+                            indexCurMap.put(range[k], i);
+                        }
+                    }
+                }
+            }
+            while (!pq.isEmpty()) {
+                // 倘若新生成的 level + 1 层 sst 文件大小已经超限
+                if (sstWriter.size() > sstLimit) {
+                    SstWriter.FinishRes finish = sstWriter.finish();
+                    sstWriter.close();
+                    this.insertNode(level + 1, seq, finish.getSize(), finish.getBlockToFilter(), finish.getIndices());
+                    // 构造一个新的 level + 1 层 sstWriter
+                    seq = this.levelToSeq[level + 1].get() + 1;
+                    sstWriter = new SstWriter(this.sstFile(level + 1, seq), this.config);
+                }
+                Kv kv = pq.poll();
+                sstWriter.append(kv.getKey(), kv.getValue());
+                if (nextCurMap.containsKey(kv)) {
+                    Integer nextCur = nextCurMap.remove(kv);
+                    Integer indexCur = indexCurMap.remove(kv);
+                    if (null == nextCur || null == indexCur) {
+                        throw new IllegalStateException("bug");
+                    }
+                    Index[] curIndexArr = pickedIndex[indexCur];
+                    Node curNode = pickedNodes.get(indexCur);
+                    if (nextCur < curIndexArr.length) {
+                        Index curIndex = curIndexArr[nextCur];
+                        Kv[] range = curNode.getRange(curIndex.getBlockOffset(), curIndex.getBlockSize());
+                        for (int k = 0; k < range.length; k++) {
+                            pq.add(range[k]);
+                            if (k == range.length - 1) {
+                                nextCurMap.put(range[k], nextCur + 1);
+                                indexCurMap.put(range[k], indexCur);
+                            }
+                        }
+                    }
+                }
+            }
+            SstWriter.FinishRes finish = sstWriter.finish();
+            this.insertNode(level + 1, seq, finish.getSize(), finish.getBlockToFilter(), finish.getIndices());
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        } finally {
+            sstWriter.close();
+        }
+        removeNodes(level, pickedNodes);
+        tryCompactSst(level + 1);
+    }
+
+    private void removeNodes(int level, List<Node> pickedNodes) {
+        // 从 lsm tree 的 nodes 中移除老节点
+        for (int i = level + 1; i >= level; i--) {
+            ReentrantReadWriteLock.WriteLock writeLock = this.levelLocks[i].writeLock();
+            writeLock.lock();
+            try {
+                this.nodes.get(i).removeAll(pickedNodes);
+            } finally {
+                writeLock.unlock();
+            }
+        }
+        // 销毁老节点，包括关闭 sst reader，并且删除节点对应 sst 磁盘文件
+        for (Node pickedNode : pickedNodes) {
+            pickedNode.destroy();
+        }
+    }
+
+
+    private List<Node> pickCompactNodes(int level) {
+        List<Node> levelNodes = nodes.get(level);
+        if (levelNodes.isEmpty()) {
+            return Collections.emptyList();
+        }
+        byte[] startKey, endKey;
+        if (level == 0) {
+            //全部合并
+            startKey= levelNodes.get(0).start();
+            endKey = levelNodes.get(0).end();
+            for (int i = 1; i < levelNodes.size(); i++) {
+                Node curNode = levelNodes.get(i);
+                if (AllUtils.compare(curNode.start(), startKey) < 0) {
+                    startKey = curNode.start();
+                }
+                if (AllUtils.compare(curNode.end(), endKey) > 0) {
+                    endKey = curNode.end();
+                }
+            }
+        } else {
+            //高层有序，层数越多合并的文件越少
+            startKey = levelNodes.get(0).start();
+            int end = levelNodes.size() / (level + 1);
+            endKey = levelNodes.get(end).end();
+        }
+
+        List<Node> pickedNodes = new ArrayList<>();
+        for (int i = level + 1; i >= level; i--) {
+            for (Node node : this.nodes.get(i)) {
+                if (AllUtils.compare(endKey, node.start()) < 0 || AllUtils.compare(startKey, node.end()) > 0) {
+                    continue;
+                }
+                // 所有范围有重叠的节点都追加到 list
+                pickedNodes.add(node);
+            }
+        }
+        return pickedNodes;
     }
 
     private void compactMemTable(MemTableCompactItem item) {
@@ -151,7 +315,7 @@ public class Tree {
         for (Node node : this.nodes.get(level)) {
             size += node.size();
         }
-        if (size <= this.config.getLevelSstSize(level)) {
+        if (size <= this.config.getLevelSstSize(level + 1)) {
             return;
         }
         boolean offer = this.levelCompactQueue.offer(level);
