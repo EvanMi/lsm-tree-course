@@ -59,8 +59,10 @@ public class Tree {
             levelLocks[i] = new ReentrantReadWriteLock();
         }
         //加载文件
+        // TODO: by yumi -> 加载过程中是否要考虑文件损坏问题，如何解决
         constructTree(); //加载sst文件
         constructMemTable(); //恢复mem table
+        // TODO: by yumi -> 当前只有一个线程用来压缩数据，是否考虑每层一个线程?
         poolService.submit(this::doBackendTask);
         Runtime.getRuntime().addShutdownHook(new Thread(this::close));
     }
@@ -171,6 +173,10 @@ public class Tree {
         String[] split = localFileName.split("_");
         // 0 level 1 seq
         return new int[] {Integer.valueOf(split[0]), Integer.valueOf(split[1])};
+    }
+
+    public void remove(byte[] key) {
+        // TODO: by yumi -> 实现删除功能
     }
 
 
@@ -624,7 +630,7 @@ public class Tree {
                     node.close();
                 }
             }
-            config.getBlockBufferPool().destroy(30);
+            config.getBlockBufferPool().destroy(5);
             System.out.println("bye!");
         }
     }

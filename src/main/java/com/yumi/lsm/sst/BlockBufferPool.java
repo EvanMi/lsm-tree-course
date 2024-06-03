@@ -18,7 +18,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class BlockBufferPool {
     //延时执行清除任务
-    private static final ScheduledExecutorService forceCleanService = Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService forceCleanService = Executors.newSingleThreadScheduledExecutor();
     //最多缓存多少个buffer
     private final int poolSize;
     //每个buffer的大小
@@ -79,6 +79,7 @@ public class BlockBufferPool {
                     BlockBufferPool.this.borrowed.clear();
                 } finally {
                     BlockBufferPool.this.borrowLock.writeLock().unlock();
+                    forceCleanService.shutdownNow();
                 }
             }, forceInterval, TimeUnit.SECONDS);
 
