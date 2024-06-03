@@ -8,28 +8,33 @@ import com.yumi.lsm.sst.SstReader;
 import com.yumi.lsm.sst.SstWriter;
 import com.yumi.lsm.util.AllUtils;
 import com.yumi.lsm.util.Kv;
+import com.yumi.lsm.wal.WalReader;
 import com.yumi.lsm.wal.WalWriter;
 import org.jctools.queues.SpscArrayQueue;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.PriorityQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class Tree {
+    private final ExecutorService poolService = Executors.newSingleThreadExecutor();
     private Config config;
     private final ReentrantReadWriteLock dataLock = new ReentrantReadWriteLock();
     private int memTableIndex = 0;
     private WalWriter walWriter;
-    private MemTable memtable;
+    private MemTable memTable;
     private List<MemTableCompactItem> readOnlyMemTableList = new ArrayList<>();
     private List<List<Node>> nodes;
     private ReentrantReadWriteLock[] levelLocks;
@@ -54,9 +59,120 @@ public class Tree {
             levelLocks[i] = new ReentrantReadWriteLock();
         }
         //加载文件
-        newMemTable(config.getWalFileSize());
-        new Thread(this::doBackendTask).start();
+        constructTree(); //加载sst文件
+        constructMemTable(); //恢复mem table
+        poolService.submit(this::doBackendTask);
+        Runtime.getRuntime().addShutdownHook(new Thread(this::close));
     }
+
+    private void constructMemTable() {
+        File dir = new File(config.getDir() + File.separator + "walfile");
+        if (!dir.exists() || !dir.isDirectory()) {
+            throw new IllegalStateException("非法的wal文件夹");
+        }
+        File[] wals = dir.listFiles(f -> f.isFile() && f.getName().endsWith(".wal"));
+        if (wals == null || wals.length == 0) {
+            newMemTable(config.getWalFileSize());
+        } else {
+            restoreMemTable(wals);
+        }
+    }
+
+    private void restoreMemTable(File[] wals) {
+        Arrays.sort(wals, (f1, f2) -> walFileToMemTableIndex(f1.getName()) - walFileToMemTableIndex(f2.getName()));
+        for (int i = 0; i < wals.length; i++) {
+            File wal = wals[i];
+            String name = wal.getName();
+            String file = config.getDir() + File.separator + "walfile" + File.separator + name;
+            WalReader walReader = new WalReader(file);
+            try {
+                MemTable memTable = config.getMemTableConstructor().create();
+                walReader.restoreMemTable(memTable);
+                if (i == wals.length - 1) {
+                    //i是最后一个，尝试作为活跃的mem table
+                    this.memTableIndex = walFileToMemTableIndex(name);
+                    try {
+                        WalWriter walWriter = new WalWriter(file, config.getWalFileSize());
+                        this.memTable = memTable;
+                        this.walWriter = walWriter;
+                    } catch (IllegalStateException e) {
+                        addToReadonlyAndFireCompact(file, memTable);
+                        this.memTableIndex++;
+                        this.newMemTable(config.getWalFileSize());
+                    }
+                } else {
+                    addToReadonlyAndFireCompact(file, memTable);
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            } finally {
+                walReader.close();
+            }
+        }
+    }
+
+    private void addToReadonlyAndFireCompact(String file, MemTable memTable) {
+        MemTableCompactItem memTableCompactItem = new MemTableCompactItem(file, memTable);
+        this.readOnlyMemTableList.add(memTableCompactItem);
+        while (true) {
+            boolean offer = this.memCompactQueue.offer(memTableCompactItem);
+            if (offer) {
+                break;
+            }
+            Thread.yield();
+        }
+    }
+
+    private int walFileToMemTableIndex(String name) {
+        return Integer.valueOf(name.replaceAll(".wal",""));
+    }
+
+    private void constructTree() {
+        File[] sstFiles = getSortedSstFiles();
+        for (File sstFile : sstFiles) {
+            loadNode(sstFile);
+        }
+    }
+
+    private void loadNode(File sstFile) {
+        String file = sstFile.getName();
+        SstReader sstReader = new SstReader(file, config);
+        Map<Integer, BitsArray> filterMap = sstReader.readFilter();
+        Index[] indices = sstReader.readIndex();
+        int size = sstReader.size();
+        int[] levelSeqFromSSTFile = getLevelSeqFromSstFile(file);
+        int level = levelSeqFromSSTFile[0];
+        int seq = levelSeqFromSSTFile[1];
+        this.insertNodeWithReader(level, seq, size, filterMap, indices, sstReader);
+    }
+
+    private File[] getSortedSstFiles() {
+        File file = new File(config.getDir());
+        if (!file.exists() || !file.isDirectory()) {
+            throw new IllegalStateException("非法的文件夹参数");
+        }
+        File[] files = file.listFiles(item -> item.isFile() && item.getName().endsWith(".sst"));
+        if (null == files || files.length == 0) {
+            return new File[0];
+        }
+        Arrays.sort(files, (f1, f2) -> {
+            int[] f1LevelSeqFromSstFile = getLevelSeqFromSstFile(f1.getName());
+            int[] f2LevelSeqFromSstFile = getLevelSeqFromSstFile(f2.getName());
+            if (f1LevelSeqFromSstFile[0] == f2LevelSeqFromSstFile[0]) {
+                return f1LevelSeqFromSstFile[1] - f2LevelSeqFromSstFile[1];
+            }
+            return f1LevelSeqFromSstFile[0] - f2LevelSeqFromSstFile[0];
+        });
+        return files;
+    }
+
+    private int[] getLevelSeqFromSstFile(String sstFileName) {
+        String localFileName = sstFileName.replaceAll(".sst", "");
+        String[] split = localFileName.split("_");
+        // 0 level 1 seq
+        return new int[] {Integer.valueOf(split[0]), Integer.valueOf(split[1])};
+    }
+
 
     public void put(byte[] key, byte[] value) {
         ReentrantReadWriteLock.WriteLock lock = dataLock.writeLock();
@@ -71,7 +187,7 @@ public class Tree {
                 assert notFull;
             }
             //2.写入mem table中
-            this.memtable.put(key, value);
+            this.memTable.put(key, value);
         } catch (Exception e) {
             throw new RuntimeException(e);
         } finally {
@@ -81,7 +197,7 @@ public class Tree {
 
     private void refreshMemTable() {
         //热表转冷表
-        MemTableCompactItem oldItem = new MemTableCompactItem(this.walFile(), this.memtable);
+        MemTableCompactItem oldItem = new MemTableCompactItem(this.walFile(), this.memTable);
         //放到冷表队列中
         readOnlyMemTableList.add(oldItem);
         this.walWriter.close();
@@ -348,6 +464,7 @@ public class Tree {
                     for (; i < levelNodes.size(); i++) {
                         if (AllUtils.compare(newNode.end(), levelNodes.get(i).start()) < 0) {
                             levelNodes.add(i, newNode);
+                            break;
                         }
                     }
                     if (i == levelNodes.size()) {
@@ -369,11 +486,11 @@ public class Tree {
 
     private void newMemTable(int size) {
         this.walWriter = new WalWriter(walFile(), size);
-        this.memtable = this.config.getMemTableConstructor().create();
+        this.memTable = this.config.getMemTableConstructor().create();
     }
 
     private String walFile() {
-        return config.getDir() + File.separator + "wal" + File.separator + this.memTableIndex + ".wal";
+        return config.getDir() + File.separator + "walfile" + File.separator + this.memTableIndex + ".wal";
     }
 
 
@@ -382,7 +499,7 @@ public class Tree {
         lock.lock();
         try {
             //mem table找
-            Optional<byte[]> valOpt = this.memtable.get(key);
+            Optional<byte[]> valOpt = this.memTable.get(key);
             if (valOpt.isPresent()) {
                 return valOpt.get();
             }
@@ -402,6 +519,7 @@ public class Tree {
         }
         //从新到旧0层的sst文件找
         ReentrantReadWriteLock.ReadLock level0Lock = this.levelLocks[0].readLock();
+        level0Lock.lock();
         try {
             List<Node> level0Nodes = this.nodes.get(0);
             int level0Len = level0Nodes.size();
@@ -426,7 +544,8 @@ public class Tree {
                 if (!nodeOpt.isPresent()) {
                     continue;
                 }
-                Optional<byte[]> valOpt = nodeOpt.get().get(key);
+                Node node = nodeOpt.get();
+                Optional<byte[]> valOpt = node.get(key);
                 if (valOpt.isPresent()) {
                     return valOpt.get();
                 }
@@ -447,9 +566,11 @@ public class Tree {
         int mid = start + ((end - start) >> 1);
         List<Node> levelNodes = this.nodes.get(level);
         Node midNode = levelNodes.get(mid);
+
         if (AllUtils.compare(midNode.end(), key) >= 0 && AllUtils.compare(midNode.start(), key) <= 0) {
             return Optional.of(midNode);
         }
+
         if (AllUtils.compare(midNode.start(), key) > 0) {
             if (mid > 0 && AllUtils.compare(key, levelNodes.get(mid - 1).end()) > 0 || mid == 0) {
                 return Optional.of(midNode);
@@ -457,9 +578,11 @@ public class Tree {
                 return this.levelBinarySearch(level, key, start, mid - 1);
             }
         }
+
+
         if (AllUtils.compare(midNode.end(), key) < 0) {
-            if (mid < end - 1 && AllUtils.compare(key, levelNodes.get(mid + 1).start()) < 0 || mid == end - 1) {
-                return Optional.of(midNode);
+            if (mid < levelNodes.size() - 1 && AllUtils.compare(key, levelNodes.get(mid + 1).start()) < 0) {
+                return Optional.of(levelNodes.get(mid + 1));
             } else {
                 return this.levelBinarySearch(level, key, mid + 1, end);
             }
@@ -467,6 +590,44 @@ public class Tree {
         return Optional.empty();
     }
 
+
+    public void close() {
+        if (stop.compareAndSet(false, true)) {
+            ExecutorService poolToShutdown = this.poolService;
+            poolToShutdown.shutdown();
+            boolean shutdown = false;
+            for (int i = 0; i < 3; i++) {
+                System.out.println("waiting... " + System.currentTimeMillis());
+                try {
+                    shutdown = poolToShutdown.awaitTermination(30, TimeUnit.SECONDS);
+                    if (shutdown) {
+                        break;
+                    }
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+            if (!shutdown) {
+                System.out.println("force shutdown");
+                poolToShutdown.shutdownNow();
+                try {
+                    if (!poolToShutdown.awaitTermination(30, TimeUnit.SECONDS)) {
+                        System.out.printf("%s didn't terminate!%n", poolToShutdown);
+                    }
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+
+            for (List<Node> nodeArr : nodes) {
+                for (Node node : nodeArr) {
+                    node.close();
+                }
+            }
+            config.getBlockBufferPool().destroy(30);
+            System.out.println("bye!");
+        }
+    }
 
     public static class MemTableCompactItem {
         private final String walFile;
