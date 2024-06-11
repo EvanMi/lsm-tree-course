@@ -587,7 +587,7 @@ public class Tree {
 
 
         if (AllUtils.compare(midNode.end(), key) < 0) {
-            if (mid < levelNodes.size() - 1 && AllUtils.compare(key, levelNodes.get(mid + 1).start()) < 0) {
+            if (mid < levelNodes.size() - 1 && AllUtils.compare(key, levelNodes.get(mid + 1).start()) < 0 || mid == levelNodes.size() - 1) {
                 return Optional.of(levelNodes.get(mid + 1));
             } else {
                 return this.levelBinarySearch(level, key, mid + 1, end);
