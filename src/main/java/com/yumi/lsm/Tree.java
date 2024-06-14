@@ -579,7 +579,7 @@ public class Tree {
 
         if (AllUtils.compare(midNode.start(), key) > 0) {
             if (mid > 0 && AllUtils.compare(key, levelNodes.get(mid - 1).end()) > 0 || mid == 0) {
-                return Optional.of(midNode);
+                return Optional.empty();
             } else {
                 return this.levelBinarySearch(level, key, start, mid - 1);
             }
@@ -588,7 +588,7 @@ public class Tree {
 
         if (AllUtils.compare(midNode.end(), key) < 0) {
             if (mid < levelNodes.size() - 1 && AllUtils.compare(key, levelNodes.get(mid + 1).start()) < 0 || mid == levelNodes.size() - 1) {
-                return Optional.of(levelNodes.get(mid + 1));
+                return Optional.empty();
             } else {
                 return this.levelBinarySearch(level, key, mid + 1, end);
             }
