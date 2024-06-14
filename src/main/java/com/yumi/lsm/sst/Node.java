@@ -50,21 +50,19 @@ public class Node {
             return Optional.empty();
         }
         Kv[] kvs = this.sstReader.readData(index.getBlockOffset(), index.getBlockSize());
-        byte[] value = binarySearchKv(kvs, 0, kvs.length - 1, key);
-        return Optional.of(value);
+        return binarySearchKv(kvs, 0, kvs.length - 1, key);
     }
 
-    private byte[] binarySearchKv(Kv[] kvs, int l, int h, byte[] targetKey) {
-        if (l == h) {
-            assert AllUtils.compare(kvs[l].getKey(), targetKey) == 0;
-            return kvs[l].getValue();
+    private Optional<byte[]> binarySearchKv(Kv[] kvs, int l, int h, byte[] targetKey) {
+        if (l > h) {
+            return Optional.empty();
         }
         int mid = l + ((h - l) >> 1);
         byte[] midKey = kvs[mid].getKey();
         if (AllUtils.compare(midKey, targetKey) == 0) {
-            return kvs[mid].getValue();
+            return Optional.of(kvs[mid].getValue());
         } else if (AllUtils.compare(midKey, targetKey) < 0) {
-            return binarySearchKv(kvs, mid + 1, l, targetKey);
+            return binarySearchKv(kvs, mid + 1, h, targetKey);
         } else {
             return binarySearchKv(kvs, l, mid -1 , targetKey);
         }
