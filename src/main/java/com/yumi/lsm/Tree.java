@@ -295,26 +295,31 @@ public class Tree {
                     seq = this.levelToSeq[level + 1].get() + 1;
                     sstWriter = new SstWriter(this.sstFile(level + 1, seq), this.config);
                 }
-                Kv kv = pq.poll();
-                sstWriter.append(kv.getKey(), kv.getValue());
-                if (nextCurMap.containsKey(kv)) {
-                    Integer nextCur = nextCurMap.remove(kv);
-                    Integer indexCur = indexCurMap.remove(kv);
-                    if (null == nextCur || null == indexCur) {
-                        throw new IllegalStateException("bug");
-                    }
-                    Index[] curIndexArr = pickedIndex[indexCur];
-                    Node curNode = pickedNodes.get(indexCur);
-                    if (nextCur < curIndexArr.length) {
-                        Index curIndex = curIndexArr[nextCur];
-                        Kv[] range = curNode.getRange(curIndex.getBlockOffset(), curIndex.getBlockSize());
-                        for (int k = 0; k < range.length; k++) {
-                            pq.add(range[k]);
-                            if (k == range.length - 1) {
-                                nextCurMap.put(range[k], nextCur + 1);
-                                indexCurMap.put(range[k], indexCur);
+                while (!pq.isEmpty()) {
+                    Kv kv = pq.poll();
+                    if (nextCurMap.containsKey(kv)) {
+                        Integer indexCur = indexCurMap.remove(kv);
+                        Integer nextCur = nextCurMap.remove(kv);
+                        if (null == nextCur || null == indexCur) {
+                            throw new IllegalStateException("bug");
+                        }
+                        Index[] curIndexArr = pickedIndex[indexCur];
+                        Node curNode = pickedNodes.get(indexCur);
+                        if (nextCur < curIndexArr.length) {
+                            Index curIndex = curIndexArr[nextCur];
+                            Kv[] range = curNode.getRange(curIndex.getBlockOffset(), curIndex.getBlockSize());
+                            for (int k = 0; k < range.length; k++) {
+                                pq.add(range[k]);
+                                if (k == range.length - 1) {
+                                    nextCurMap.put(range[k], nextCur + 1);
+                                    indexCurMap.put(range[k], indexCur);
+                                }
                             }
                         }
+                    }
+                    if (pq.isEmpty() || AllUtils.compare(pq.peek().getKey(), kv.getKey()) != 0) {
+                        sstWriter.append(kv.getKey(), kv.getValue());
+                        break;
                     }
                 }
             }
